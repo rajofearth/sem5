@@ -15,9 +15,9 @@ uv run python main.py
 
 ## Usage
 
-A window opens with a sidebar on the left containing two entries:
+A window opens with a clean, minimal sidebar containing two pages:
 
-- **Home** — displays "Hello homepage,"
-- **Settings** — displays "Hello setting page"
+- **Home** — an agent workspace for entering instructions, running tasks, and viewing progress
+- **Settings** — API/model configuration and native Windows permission toggles
 
-Clicking an entry switches the page shown on the right.
+Clicking an entry switches the page shown on the right. Use the sun button to switch between dark and light themes.
