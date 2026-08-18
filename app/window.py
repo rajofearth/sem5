@@ -1,9 +1,12 @@
+import json
 import os
+import subprocess
 import sys
 from html import escape
+from pathlib import Path
 from time import monotonic
 from dotenv import load_dotenv
-from PyQt5.QtCore import QObject, QThread, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QObject, QThread, Qt, pyqtSignal
 from cerebras.cloud.sdk import Cerebras
 from PyQt5.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton, QPlainTextEdit,
@@ -11,11 +14,68 @@ from PyQt5.QtWidgets import (
 )
 
 load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+TOOLS = [
+    {
+        'type': 'function',
+        'function': {
+            'name': 'read_file',
+            'description': 'Read a UTF-8 text file in the project workspace.',
+            'parameters': {
+                'type': 'object',
+                'properties': {'path': {'type': 'string', 'description': 'Project-relative file path'}},
+                'required': ['path'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'run_pwsh',
+            'description': 'Run a PowerShell command in the project workspace.',
+            'parameters': {
+                'type': 'object',
+                'properties': {'command': {'type': 'string', 'description': 'PowerShell command to run'}},
+                'required': ['command'],
+            },
+        },
+    },
+]
+
+
+def execute_tool(name, arguments):
+    if name == 'read_file':
+        requested = (PROJECT_ROOT / arguments['path']).resolve()
+        if PROJECT_ROOT not in requested.parents and requested != PROJECT_ROOT:
+            return 'Error: file must be inside the project workspace.'
+        try:
+            return requested.read_text(encoding='utf-8')[:100000]
+        except OSError as error:
+            return f'Error reading file: {error}'
+
+    if name == 'run_pwsh':
+        try:
+            result = subprocess.run(
+                ['pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', arguments['command']],
+                cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=30,
+            )
+            output = (result.stdout + result.stderr).strip()
+            return output[-100000:] if output else f'Command exited with code {result.returncode}.'
+        except FileNotFoundError:
+            return 'Error: pwsh was not found on this machine.'
+        except subprocess.TimeoutExpired:
+            return 'Error: PowerShell command timed out after 30 seconds.'
+        except OSError as error:
+            return f'Error running PowerShell: {error}'
+
+    return f'Error: unknown tool {name}.'
 
 
 class ChatWorker(QObject):
     finished = pyqtSignal(str)
     failed = pyqtSignal(str)
+    tool_started = pyqtSignal(str, str)
 
     def __init__(self, prompt, model):
         super().__init__()
@@ -24,12 +84,40 @@ class ChatWorker(QObject):
 
     def run(self):
         try:
-            client = Cerebras(api_key=os.environ["CEREBRAS_API_KEY"])
-            response = client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": self.prompt}],
-            )
-            self.finished.emit(response.choices[0].message.content or "")
+            client = Cerebras(api_key=os.environ['CEREBRAS_API_KEY'])
+            messages = [
+                {
+                    'role': 'system',
+                    'content': (
+                        'Answer briefly and directly in plain text. Do not use Markdown, bullet symbols, '
+                        'headings, code fences, or decorative formatting. Use the available tools when needed. '
+                        'Never claim a command ran or a file was read unless the tool returned the result.'
+                    ),
+                },
+                {'role': 'user', 'content': self.prompt},
+            ]
+            for _ in range(8):
+                response = client.chat.completions.create(
+                    model=self.model, messages=messages, tools=TOOLS,
+                )
+                message = response.choices[0].message
+                tool_calls = message.tool_calls or []
+                messages.append(message.model_dump(exclude_none=True))
+                if not tool_calls:
+                    self.finished.emit(message.content or '')
+                    return
+                for call in tool_calls:
+                    try:
+                        arguments = json.loads(call.function.arguments)
+                        detail = arguments.get('path') or arguments.get('command') or 'running'
+                        self.tool_started.emit(call.function.name, str(detail))
+                        result = execute_tool(call.function.name, arguments)
+                    except (ValueError, KeyError, TypeError) as error:
+                        result = f'Tool input error: {error}'
+                    messages.append({
+                        'role': 'tool', 'tool_call_id': call.id, 'content': result,
+                    })
+            self.failed.emit('The model used too many tool calls without producing an answer.')
         except Exception as error:
             self.failed.emit(str(error))
 
@@ -48,34 +136,6 @@ class AutoGrowTextEdit(QPlainTextEdit):
             self.window().send(); event.accept(); return
         super().keyPressEvent(event)
 
-
-PLANS = {
-    'download': ([('Reading Downloads folder', r'C:\Users\Yashraj\Downloads — 23 items'),
-                  ('Classifying files by type', '14 documents, 6 images, 3 archives'),
-                  ('Creating destination folders', r'mkdir Documents\Sorted, Images\Sorted'),
-                  ('Moving files', r'moved 14 → Documents\Sorted, 6 → Images\Sorted'),
-                  ('Moving archives', r'moved 3 → Documents\Sorted\Archives')],
-                 'Sorted 23 files into 3 folders. Your Downloads folder is organized.'),
-    'excel': ([('Opening Excel', 'launched EXCEL.EXE'), ('Locating workbook', 'opened Q3_report.xlsx'),
-               ('Reading column B', '42 rows, range B2:B43'), ('Computing total', 'SUM(B2:B43) = 184,220.50'),
-               ('Writing result', 'wrote total to B45 and saved workbook')],
-              'Column B totals 184,220.50 — written into B45 and saved.'),
-    'schedule': ([('Reading target folder', r'C:\Users\Yashraj\Documents'),
-                  ('Creating scheduled task', 'Task Scheduler — “nightly-backup”'),
-                  ('Setting trigger', 'runs daily at 23:30'),
-                  ('Setting action', r'robocopy Documents → D:\Backups\Documents /MIR')],
-                 'Scheduled a nightly backup at 11:30 PM. The first run is tonight.'),
-}
-
-
-def plan(text):
-    q = text.lower()
-    for key in PLANS:
-        if key in q or (key == 'download' and 'organi' in q) or (key == 'excel' and 'spreadsheet' in q):
-            return PLANS[key]
-    return ([('Planning task', f'parsed instruction: “{text}”'), ('Taking control', 'focused active desktop session'),
-             ('Executing', 'running planned actions'), ('Verifying result', 'checked final state')],
-            'Done — let me know if you want any adjustments.')
 
 
 class Trace(QFrame):
@@ -166,16 +226,6 @@ class MainWindow(QMainWindow):
         self.feed.insertWidget(self.feed.count() - 1, agent)
         self.scroll_to_bottom()
 
-    def send_demo(self, text):
-        steps, debrief = plan(text)
-        self.trace = Trace(steps, self.messages)
-        self.trace.user_opened = False
-        self.feed.insertWidget(self.feed.count() - 1, self.trace)
-        self.started = monotonic(); self.index = 0; self.debrief = debrief
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.tick)
-        self.timer.start(900)
-        self.tick()
 
     def send_to_cerebras(self, text):
         self.started = monotonic()
@@ -188,24 +238,31 @@ class MainWindow(QMainWindow):
         self.api_thread.started.connect(self.worker.run)
         self.worker.finished.connect(self.on_cerebras_finished)
         self.worker.failed.connect(self.on_cerebras_failed)
+        self.worker.tool_started.connect(self.on_tool_started)
         self.worker.finished.connect(self.api_thread.quit)
         self.worker.failed.connect(self.api_thread.quit)
         self.api_thread.finished.connect(self.worker.deleteLater)
         self.api_thread.finished.connect(self.api_thread.deleteLater)
         self.api_thread.start()
 
+    def on_tool_started(self, name, detail):
+        labels = {'read_file': 'Reading file', 'run_pwsh': 'Running PowerShell'}
+        self.trace.add_step(labels.get(name, name), detail)
+        self.trace.refresh(round(monotonic() - self.started))
+        self.scroll_to_bottom()
+
     def on_cerebras_finished(self, text):
         self.trace.finish(round(monotonic() - self.started))
-        agent = QLabel(escape(text))
-        agent.setObjectName('agent'); agent.setWordWrap(True)
+        agent = QLabel(text)
+        agent.setObjectName('agent'); agent.setWordWrap(True); agent.setTextFormat(Qt.PlainText)
         self.feed.insertWidget(self.feed.count() - 1, agent)
         self.running = False
         self.scroll_to_bottom()
 
     def on_cerebras_failed(self, error):
         self.trace.finish(round(monotonic() - self.started))
-        agent = QLabel(f'<b>Request failed:</b> {escape(error)}')
-        agent.setObjectName('agent'); agent.setWordWrap(True); agent.setTextFormat(Qt.RichText)
+        agent = QLabel(f'Request failed: {error}')
+        agent.setObjectName('agent'); agent.setWordWrap(True); agent.setTextFormat(Qt.PlainText)
         self.feed.insertWidget(self.feed.count() - 1, agent)
         self.running = False
         self.scroll_to_bottom()
@@ -213,11 +270,6 @@ class MainWindow(QMainWindow):
     def scroll_to_bottom(self):
         self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum())
 
-    def tick(self):
-        if self.index < len(self.trace.steps): self.trace.add_step(*self.trace.steps[self.index]); self.index += 1
-        else:
-            self.timer.stop(); self.running = False; self.trace.finish(round(monotonic() - self.started)); agent = QLabel(self.debrief); agent.setObjectName('agent'); agent.setWordWrap(True); self.feed.insertWidget(self.feed.count() - 1, agent)
-        self.trace.refresh(round(monotonic() - self.started)); self.scroll_to_bottom()
 
     def styles(self):
         return '''QWidget{background:#111213;color:#e6e6e6;font-family:Segoe UI;font-size:13px}

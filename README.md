@@ -22,10 +22,9 @@ $env:CEREBRAS_MODEL = "gpt-oss-120b"
 uv run python main.py
 ```
 
-If no API key is configured, the sample task buttons and matching prompts run in
-offline demo mode. API requests execute on a background thread so the window
-remains responsive. Keys are read only from the environment and are not stored
-in the project.
+An API key is required to use the app. API requests execute on a background
+thread so the window remains responsive. Keys are read only from the environment
+and are not stored in the project.
 
 ## Usage
 
