@@ -13,11 +13,23 @@ uv sync
 uv run python main.py
 ```
 
+To use the live Cerebras chat backend, set an API key before starting the app:
+
+```powershell
+$env:CEREBRAS_API_KEY = "your-api-key-here"
+# Optional; defaults to gpt-oss-120b
+$env:CEREBRAS_MODEL = "gpt-oss-120b"
+uv run python main.py
+```
+
+If no API key is configured, the sample task buttons and matching prompts run in
+offline demo mode. API requests execute on a background thread so the window
+remains responsive. Keys are read only from the environment and are not stored
+in the project.
+
 ## Usage
 
-A window opens with a clean, minimal sidebar containing two pages:
-
-- **Home** — an agent workspace for entering instructions, running tasks, and viewing progress
-- **Settings** — API/model configuration and native Windows permission toggles
-
-Clicking an entry switches the page shown on the right. Use the sun button to switch between dark and light themes.
+A window opens with a clean, minimal agent workspace for entering instructions,
+running tasks, and viewing progress. Enter submits a prompt; Shift+Enter adds a
+new line. The live backend uses the official `cerebras_cloud_sdk` package and
+returns the model response in the conversation.

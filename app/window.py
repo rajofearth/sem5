@@ -1,11 +1,38 @@
+import os
 import sys
 from html import escape
 from time import monotonic
-from PyQt5.QtCore import Qt, QTimer
+from dotenv import load_dotenv
+from PyQt5.QtCore import QObject, QThread, Qt, QTimer, pyqtSignal
+from cerebras.cloud.sdk import Cerebras
 from PyQt5.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton, QPlainTextEdit,
     QScrollArea, QSizePolicy, QToolButton, QVBoxLayout, QWidget,
 )
+
+load_dotenv()
+
+
+class ChatWorker(QObject):
+    finished = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, prompt, model):
+        super().__init__()
+        self.prompt = prompt
+        self.model = model
+
+    def run(self):
+        try:
+            client = Cerebras(api_key=os.environ["CEREBRAS_API_KEY"])
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": self.prompt}],
+            )
+            self.finished.emit(response.choices[0].message.content or "")
+        except Exception as error:
+            self.failed.emit(str(error))
+
 
 class AutoGrowTextEdit(QPlainTextEdit):
     def __init__(self, parent=None):
@@ -115,16 +142,82 @@ class MainWindow(QMainWindow):
 
     def send(self, text=None):
         text = (text if text is not None else self.input.toPlainText()).strip()
-        if not text or self.running: return
-        self.clear_empty_state(); self.running = True; self.input.clear(); user = QLabel(escape(text)); user.setObjectName('user'); user.setWordWrap(True); user.setMaximumWidth(430); user.setAlignment(Qt.AlignLeft); self.feed.insertWidget(self.feed.count() - 1, user, alignment=Qt.AlignRight)
-        steps, debrief = plan(text); self.trace = Trace(steps, self.messages); self.trace.user_opened = False; self.feed.insertWidget(self.feed.count() - 1, self.trace)
-        self.started = monotonic(); self.index = 0; self.debrief = debrief; self.timer = QTimer(self); self.timer.timeout.connect(self.tick); self.timer.start(900); self.tick()
+        if not text or self.running:
+            return
+        self.clear_empty_state()
+        self.running = True
+        self.input.clear()
+        user = QLabel(escape(text))
+        user.setObjectName('user')
+        user.setWordWrap(True)
+        user.setMaximumWidth(430)
+        user.setAlignment(Qt.AlignLeft)
+        self.feed.insertWidget(self.feed.count() - 1, user, alignment=Qt.AlignRight)
+
+        if not os.environ.get('CEREBRAS_API_KEY'):
+            self.show_error('CEREBRAS_API_KEY is missing. Add it to .env and restart the app.')
+            return
+        self.send_to_cerebras(text)
+
+    def show_error(self, message):
+        self.running = False
+        agent = QLabel(escape(message))
+        agent.setObjectName('agent'); agent.setWordWrap(True)
+        self.feed.insertWidget(self.feed.count() - 1, agent)
+        self.scroll_to_bottom()
+
+    def send_demo(self, text):
+        steps, debrief = plan(text)
+        self.trace = Trace(steps, self.messages)
+        self.trace.user_opened = False
+        self.feed.insertWidget(self.feed.count() - 1, self.trace)
+        self.started = monotonic(); self.index = 0; self.debrief = debrief
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(900)
+        self.tick()
+
+    def send_to_cerebras(self, text):
+        self.started = monotonic()
+        self.trace = Trace([('Contacting Cerebras', 'Sending request to the configured model')], self.messages)
+        self.trace.user_opened = False
+        self.feed.insertWidget(self.feed.count() - 1, self.trace)
+        self.api_thread = QThread(self)
+        self.worker = ChatWorker(text, os.environ.get('CEREBRAS_MODEL', 'gpt-oss-120b'))
+        self.worker.moveToThread(self.api_thread)
+        self.api_thread.started.connect(self.worker.run)
+        self.worker.finished.connect(self.on_cerebras_finished)
+        self.worker.failed.connect(self.on_cerebras_failed)
+        self.worker.finished.connect(self.api_thread.quit)
+        self.worker.failed.connect(self.api_thread.quit)
+        self.api_thread.finished.connect(self.worker.deleteLater)
+        self.api_thread.finished.connect(self.api_thread.deleteLater)
+        self.api_thread.start()
+
+    def on_cerebras_finished(self, text):
+        self.trace.finish(round(monotonic() - self.started))
+        agent = QLabel(escape(text))
+        agent.setObjectName('agent'); agent.setWordWrap(True)
+        self.feed.insertWidget(self.feed.count() - 1, agent)
+        self.running = False
+        self.scroll_to_bottom()
+
+    def on_cerebras_failed(self, error):
+        self.trace.finish(round(monotonic() - self.started))
+        agent = QLabel(f'<b>Request failed:</b> {escape(error)}')
+        agent.setObjectName('agent'); agent.setWordWrap(True); agent.setTextFormat(Qt.RichText)
+        self.feed.insertWidget(self.feed.count() - 1, agent)
+        self.running = False
+        self.scroll_to_bottom()
+
+    def scroll_to_bottom(self):
+        self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum())
 
     def tick(self):
         if self.index < len(self.trace.steps): self.trace.add_step(*self.trace.steps[self.index]); self.index += 1
         else:
             self.timer.stop(); self.running = False; self.trace.finish(round(monotonic() - self.started)); agent = QLabel(self.debrief); agent.setObjectName('agent'); agent.setWordWrap(True); self.feed.insertWidget(self.feed.count() - 1, agent)
-        self.trace.refresh(round(monotonic() - self.started)); self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum())
+        self.trace.refresh(round(monotonic() - self.started)); self.scroll_to_bottom()
 
     def styles(self):
         return '''QWidget{background:#111213;color:#e6e6e6;font-family:Segoe UI;font-size:13px}
