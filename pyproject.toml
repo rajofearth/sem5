@@ -1,7 +1,7 @@
 [project]
-name = "sem5"
+name = "sem4"
 version = "0.1.0"
-description = "Add your description here"
+description = "A Qt 5 desktop agent that chats with the Cerebras API and runs file and shell tools."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
